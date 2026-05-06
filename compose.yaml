@@ -1,0 +1,16 @@
+services:
+  ftp-server:
+    image: delfer/alpine-ftp-server
+    container_name: ftp-test-server
+    ports:
+      - "${FTP_CONTROL_PORT}:21"
+      - "${FTP_MIN_PASSIVE_PORT}-${FTP_MAX_PASSIVE_PORT}:${FTP_MIN_PASSIVE_PORT}-${FTP_MAX_PASSIVE_PORT}"
+    environment:
+      # Removed internal quotes to prevent literal quote characters in the credentials
+      - USERS=${FTP_DEFAULT_USER}|${FTP_DEFAULT_USER_PASS}
+      - ADDRESS=${FTP_HOST}
+      - MIN_PORT=${FTP_MIN_PASSIVE_PORT}
+      - MAX_PORT=${FTP_MAX_PASSIVE_PORT}
+    volumes:
+      # Updated path to use the variable so the home directory matches the user
+      - ./ftp_data:/home/${FTP_DEFAULT_USER}

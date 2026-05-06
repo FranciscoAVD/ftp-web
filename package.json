@@ -1,0 +1,17 @@
+{
+  "name": "ftp-web",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@t3-oss/env-core": "^0.13.11",
+    "hono": "^4.12.17",
+    "zod": "^4.4.3"
+  }
+}
