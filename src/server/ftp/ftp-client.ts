@@ -149,8 +149,8 @@ export class FTPClient {
     const host = `${h1}.${h2}.${h3}.${h4}`;
     const port = (Number(p1) << 8) + Number(p2);
 
-    const min = env.FTP_MIN_PORT;
-    const max = env.FTP_MAX_PORT;
+    const min = env.FTP_MIN_PASV_PORT;
+    const max = env.FTP_MAX_PASV_PORT;
 
     if (port < min || port > max) {
       throw new Error(`Port ${port} out of allowed range (${min}, ${max})`);
