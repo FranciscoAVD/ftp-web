@@ -8,6 +8,9 @@ type PendingResponse = {
   reject: (reason?: unknown) => void;
 };
 
+const RESPONSE_TIMEOUT = 30_000 as const;
+const RESPONSE_DELIMITER = "\r\n" as const;
+
 export class FTPClient {
   private controlSocket: Bun.Socket<undefined> | null = null;
   private dataSocket: Bun.Socket<undefined> | null = null;
@@ -15,12 +18,15 @@ export class FTPClient {
   private controlBuffer = "";
   private dataBuffer: Uint8Array[] = [];
   private pendingResponses: PendingResponse[] = [];
+  private responseQueue: string[] = [];
+
   private dataSocketClosed: Promise<void> | null = null;
   private resolveDataClosed: (() => void) | null = null;
+  private rejectDataClosed: ((reason?: unknown) => void) | null = null;
 
   /**
    * Wrapper around Bun.connect(...)
-   * Meant to be used with createControlSocket or createDataSocket
+   * Meant to be used with connectControlSocket or connectDataSocket
    */
   private async connect(
     config: Config,
@@ -38,9 +44,6 @@ export class FTPClient {
             this.dataBuffer.push(new Uint8Array(data));
           }
         },
-        open: () => {
-          // connection established
-        },
         close: () => {
           if (kind === "data") {
             this.resolveDataClosed?.();
@@ -48,10 +51,11 @@ export class FTPClient {
         },
         error: (_socket, error) => {
           if (kind === "control") {
-            // Reject all pending responses
             while (this.pendingResponses.length) {
               this.pendingResponses.shift()!.reject(error);
             }
+          } else {
+            this.rejectDataClosed?.(error);
           }
         },
       },
@@ -61,52 +65,84 @@ export class FTPClient {
   /**
    * Parses the control buffer for complete responses (terminated by \r\n)
    * and resolves pending response promises. Handles multi-line responses
-   * following RFC 959 (e.g. "220-..." then "220 end").
+   * following RFC 959 (e.g. "220-..." then "220 end"). Unsolicited
+   * responses are queued for the next awaitResponse() call.
    */
   private drainControlBuffer() {
     while (true) {
-      const newlineIdx = this.controlBuffer.indexOf("\r\n");
+      const newlineIdx = this.controlBuffer.indexOf(RESPONSE_DELIMITER);
       if (newlineIdx === -1) break;
 
       const line = this.controlBuffer.slice(0, newlineIdx);
+      let full: string;
+
       // Multi-line: "xyz-..." continues until "xyz " appears
       if (/^\d{3}-/.test(line)) {
         const code = line.slice(0, 3);
-        const endIdx = this.controlBuffer.indexOf(`\r\n${code} `);
+        const endIdx = this.controlBuffer.indexOf(
+          `${RESPONSE_DELIMITER}${code} `,
+          newlineIdx,
+        );
         if (endIdx === -1) break; // wait for more data
-        // find end-of-line of the terminating line
         const afterStart = endIdx + 2;
         const finalNewline = this.controlBuffer.indexOf("\r\n", afterStart);
         if (finalNewline === -1) break;
-        const full = this.controlBuffer.slice(0, finalNewline);
+        full = this.controlBuffer.slice(0, finalNewline);
         this.controlBuffer = this.controlBuffer.slice(finalNewline + 2);
-        this.pendingResponses.shift()?.resolve(full);
       } else {
+        full = line;
         this.controlBuffer = this.controlBuffer.slice(newlineIdx + 2);
-        this.pendingResponses.shift()?.resolve(line);
+      }
+
+      const pending = this.pendingResponses.shift();
+      if (pending) {
+        pending.resolve(full);
+      } else {
+        this.responseQueue.push(full);
       }
     }
   }
 
-  async connectControlSocket(config: Config) {
+  async connectControlSocket(config: Config): Promise<string> {
     if (this.controlSocket) throw new Error("Control socket already exists");
     this.controlSocket = await this.connect(config, "control");
-    // Await the server greeting (220)
-    return await this.awaitResponse();
+    return this.awaitResponse();
   }
 
   private async connectDataSocket(config: Config): Promise<void> {
     if (this.dataSocket) this.dataSocket.end();
     this.dataBuffer = [];
-    this.dataSocketClosed = new Promise((resolve) => {
+    this.dataSocketClosed = new Promise((resolve, reject) => {
       this.resolveDataClosed = resolve;
+      this.rejectDataClosed = reject;
     });
     this.dataSocket = await this.connect(config, "data");
   }
 
   private awaitResponse(): Promise<string> {
+    const queued = this.responseQueue.shift();
+    if (queued !== undefined) return Promise.resolve(queued);
+
     return new Promise((resolve, reject) => {
-      this.pendingResponses.push({ resolve, reject });
+      const entry: PendingResponse = { resolve, reject };
+      this.pendingResponses.push(entry);
+
+      const timeout = setTimeout(() => {
+        const idx = this.pendingResponses.indexOf(entry);
+        if (idx !== -1) {
+          this.pendingResponses.splice(idx, 1);
+          reject(new Error("FTP response timeout"));
+        }
+      }, RESPONSE_TIMEOUT);
+
+      const wrap =
+        <T extends (v: never) => void>(fn: T) =>
+        (v: never) => {
+          clearTimeout(timeout);
+          fn(v);
+        };
+      entry.resolve = wrap(resolve) as PendingResponse["resolve"];
+      entry.reject = wrap(reject) as PendingResponse["reject"];
     });
   }
 
@@ -122,7 +158,7 @@ export class FTPClient {
     return this.awaitResponse();
   }
 
-  async responseType(type: "UTF-8" | "ASCII") {
+  async setTransferType(type: "ASCII" | "BINARY") {
     return this.sendMessage("TYPE", type === "ASCII" ? "A" : "I");
   }
 
@@ -153,14 +189,13 @@ export class FTPClient {
     const max = env.FTP_MAX_PASV_PORT;
 
     if (port < min || port > max) {
-      throw new Error(`Port ${port} out of allowed range (${min}, ${max})`);
+      throw new Error(`Port ${port} out of allowed range [${min}, ${max}]`);
     }
 
     return { host, port };
   }
 
-  /** Prints current working directory */
-  async current() {
+  async currentDirectory() {
     return this.sendMessage("PWD");
   }
 
@@ -180,9 +215,10 @@ export class FTPClient {
    */
   async list(path?: string): Promise<string> {
     await this.passive();
-    await this.sendMessage("LIST", path ?? "/");
+    await this.sendMessage("LIST", path);
+    const transferComplete = this.awaitResponse();
     await this.dataSocketClosed;
-    await this.awaitResponse();
+    await transferComplete; // "226 Transfer complete"
 
     const merged = this.concatDataBuffer();
     this.dataSocket = null;
@@ -196,18 +232,20 @@ export class FTPClient {
   }): Promise<void> {
     await this.passive();
     await this.sendMessage("STOR", file.path);
+    const transferComplete = this.awaitResponse();
     this.dataSocket!.write(file.data);
     this.dataSocket!.end();
     await this.dataSocketClosed;
-    await this.awaitResponse();
+    await transferComplete;
     this.dataSocket = null;
   }
 
   async download(path: string): Promise<Uint8Array> {
     await this.passive();
     await this.sendMessage("RETR", path);
+    const transferComplete = this.awaitResponse();
     await this.dataSocketClosed;
-    await this.awaitResponse();
+    await transferComplete;
 
     const merged = this.concatDataBuffer();
     this.dataSocket = null;
@@ -222,19 +260,28 @@ export class FTPClient {
     this.dataSocket = null;
     this.controlBuffer = "";
     this.dataBuffer = [];
+    this.responseQueue = [];
     for (const p of this.pendingResponses) {
       p.reject(new Error("Client disconnected"));
     }
     this.pendingResponses = [];
+    this.rejectDataClosed?.(new Error("Client disconnected"));
     this.dataSocketClosed = null;
     this.resolveDataClosed = null;
+    this.rejectDataClosed = null;
   }
 
   /** Wrapper around disconnect with graceful QUIT */
   async close() {
     try {
       if (this.controlSocket) {
-        await this.sendMessage("QUIT");
+        // Race QUIT against a short timeout so a hung server doesn't block close.
+        await Promise.race([
+          this.sendMessage("QUIT"),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("QUIT timeout")), 2_000),
+          ),
+        ]);
       }
     } catch {
       // ignore – we're closing anyway

@@ -19,12 +19,17 @@ export const env = createEnv({
       .refine((p) => Number.isInteger(parseInt(p)))
       .transform((p) => Number(p)),
   },
-  shared: {},
+  shared: {
+    FTP_DEFAULT_USER: z.string(),
+    FTP_DEFAULT_USER_PASS: z.string(),
+  },
   runtimeEnv: {
     FTP_SERVER_HOST: Bun.env.FTP_SERVER_HOST,
     FTP_CONTROL_PORT: Bun.env.FTP_CONTROL_PORT,
     FTP_MIN_PASV_PORT: Bun.env.FTP_MIN_PASV_PORT,
     FTP_MAX_PASV_PORT: Bun.env.FTP_MAX_PASV_PORT,
+    FTP_DEFAULT_USER: Bun.env.FTP_DEFAULT_USER,
+    FTP_DEFAULT_USER_PASS: Bun.env.FTP_DEFAULT_USER_PASS,
   },
   emptyStringAsUndefined: true,
 });
