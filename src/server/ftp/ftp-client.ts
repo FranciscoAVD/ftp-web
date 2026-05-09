@@ -33,6 +33,9 @@ export class FTPClient {
   private resolveDataClosed: (() => void) | null = null;
   private rejectDataClosed: ((reason?: unknown) => void) | null = null;
 
+  /**************************************************************/
+  /*********************Private Utilities************************/
+  /**************************************************************/
   /**
    * Initializes a socket connection for either control or data streams.
    */
@@ -68,6 +71,20 @@ export class FTPClient {
         },
       },
     });
+  }
+
+  /**
+   * Merges all collected data chunks into a single Uint8Array.
+   */
+  private concatDataBuffer(): Uint8Array {
+    const total = this.dataBuffer.reduce((n, c) => n + c.byteLength, 0);
+    const merged = new Uint8Array(total);
+    let off = 0;
+    for (const chunk of this.dataBuffer) {
+      merged.set(chunk, off);
+      off += chunk.byteLength;
+    }
+    return merged;
   }
 
   /**
@@ -127,14 +144,8 @@ export class FTPClient {
   }
 
   /**
-   * Establishes the primary control connection to the FTP server.
+   * Helper to reset data socket internals
    */
-  async connectControlSocket(config: Config): FTPResponse {
-    if (this.controlSocket) throw new Error("Control socket already exists");
-    this.controlSocket = await this.connect(config, "control");
-    return this.awaitResponse();
-  }
-
   private closeDataSocket() {
     if (this.dataSocket) {
       this.dataSocket.end();
@@ -200,35 +211,35 @@ export class FTPClient {
   }
 
   /**
-   * Sets the transfer mode to either ASCII or Image (Binary).
+   * Establishes the primary control connection to the FTP server.
    */
-  async setTransferType(type: "ASCII" | "BINARY") {
-    return this.sendMessage("TYPE", type === "ASCII" ? "A" : "I");
+  async connectControlSocket(config: Config): FTPResponse {
+    if (this.controlSocket) throw new Error("Control socket already exists");
+    this.controlSocket = await this.connect(config, "control");
+    return this.awaitResponse();
   }
 
   /**
-   * Sends the USER command for authentication.
+   * Closes all connections and clears internal state.
    */
-  async username(user: string): FTPResponse {
-    return this.sendMessage("USER", user);
-  }
+  private disconnect() {
+    this.controlSocket?.end();
+    this.dataSocket?.end();
+    this.controlSocket = null;
+    this.dataSocket = null;
+    this.controlBuffer = "";
+    this.dataBuffer = [];
+    this.responseQueue = [];
 
-  /**
-   * Sends the PASS command for authentication.
-   */
-  async password(pass: string): FTPResponse {
-    return this.sendMessage("PASS", pass);
-  }
+    for (const p of this.pendingResponses) {
+      p.reject(new Error("Client disconnected"));
+    }
+    this.pendingResponses = [];
 
-  /**
-   * Enters passive mode and initializes the data socket connection.
-   */
-  private async passive(): FTPResponse {
-    const res = await this.sendMessage("PASV");
-    if (!res.ok) return res;
-    const config = this.parsePassiveResponse(res.raw);
-    await this.connectDataSocket(config);
-    return res;
+    this.rejectDataClosed?.(new Error("Client disconnected"));
+    this.dataSocketClosed = null;
+    this.resolveDataClosed = null;
+    this.rejectDataClosed = null;
   }
 
   /**
@@ -253,22 +264,102 @@ export class FTPClient {
     return { host, port };
   }
 
-  async currentDirectory(): FTPResponse {
-    return this.sendMessage("PWD");
+  /**************************************************************/
+  /*********************Connection & Auth************************/
+  /**************************************************************/
+  /**
+   * Sends the USER command for authentication.
+   */
+  async username(user: string): FTPResponse {
+    return this.sendMessage("USER", user);
   }
 
   /**
-   * Merges all collected data chunks into a single Uint8Array.
+   * Sends the PASS command for authentication.
    */
-  private concatDataBuffer(): Uint8Array {
-    const total = this.dataBuffer.reduce((n, c) => n + c.byteLength, 0);
-    const merged = new Uint8Array(total);
-    let off = 0;
-    for (const chunk of this.dataBuffer) {
-      merged.set(chunk, off);
-      off += chunk.byteLength;
+  async password(pass: string): FTPResponse {
+    return this.sendMessage("PASS", pass);
+  }
+
+  /**
+   * Gracefully shuts down the FTP session.
+   */
+  async close() {
+    try {
+      if (this.controlSocket) {
+        await Promise.race([
+          this.sendMessage("QUIT"),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("QUIT timeout")), 2_000),
+          ),
+        ]);
+      }
+    } catch {
+      // Ignore errors during graceful shutdown
+    } finally {
+      this.disconnect();
     }
-    return merged;
+  }
+
+  /**************************************************************/
+  /*********************Channel & Transfer***********************/
+  /**************************************************************/
+  /**
+   * Requests port from the server and attempts to connect to it
+   */
+  private async passive(): FTPResponse {
+    const res = await this.sendMessage("PASV");
+    if (!res.ok) return res;
+    const config = this.parsePassiveResponse(res.raw);
+    await this.connectDataSocket(config);
+    return res;
+  }
+
+  /**
+   * Sets the transfer mode to either ASCII or Image (Binary).
+   */
+  async setTransferType(type: "ASCII" | "BINARY") {
+    return this.sendMessage("TYPE", type === "ASCII" ? "A" : "I");
+  }
+
+  /**
+   * Sets the file structure to File (F), Record (R), or Page (P).
+   */
+  async setFileStructure(structure: "FILE" | "RECORD" | "PAGE"): FTPResponse {
+    const map = { FILE: "F", RECORD: "R", PAGE: "P" } as const;
+    return this.sendMessage("STRU", map[structure]);
+  }
+
+  /**
+   * Sets the transfer mode to Stream (S), Block (B), or Compressed (C).
+   */
+  async setTransferMode(mode: "STREAM" | "BLOCK" | "COMPRESSED"): FTPResponse {
+    const map = { STREAM: "S", BLOCK: "B", COMPRESSED: "C" } as const;
+    return this.sendMessage("MODE", map[mode]);
+  }
+
+  /**************************************************************/
+  /************************File Operations***********************/
+  /**************************************************************/
+  /**
+   * Creates a new directory at the specified path
+   */
+  async makeDirectory(path: string): FTPResponse {
+    return this.sendMessage("MKD", path);
+  }
+
+  /**
+   * Changes the current working directory to the specified path
+   */
+  async changeDirectory(path: string): FTPResponse {
+    return this.sendMessage("CWD", path);
+  }
+
+  /**
+   * Prints the current working directory
+   */
+  async currentDirectory(): FTPResponse {
+    return this.sendMessage("PWD");
   }
 
   /**
@@ -338,46 +429,20 @@ export class FTPClient {
     }
   }
 
+  /**************************************************************/
+  /***************************Helpers****************************/
+  /**************************************************************/
   /**
-   * Closes all connections and clears internal state.
+   * Sends a NOOP to keep the connection alive or verify responsiveness.
    */
-  private disconnect() {
-    this.controlSocket?.end();
-    this.dataSocket?.end();
-    this.controlSocket = null;
-    this.dataSocket = null;
-    this.controlBuffer = "";
-    this.dataBuffer = [];
-    this.responseQueue = [];
-
-    for (const p of this.pendingResponses) {
-      p.reject(new Error("Client disconnected"));
-    }
-    this.pendingResponses = [];
-
-    this.rejectDataClosed?.(new Error("Client disconnected"));
-    this.dataSocketClosed = null;
-    this.resolveDataClosed = null;
-    this.rejectDataClosed = null;
+  async noop(): FTPResponse {
+    return this.sendMessage("NOOP");
   }
 
   /**
-   * Gracefully shuts down the FTP session.
+   * Requests help information from the server, optionally about a command.
    */
-  async close() {
-    try {
-      if (this.controlSocket) {
-        await Promise.race([
-          this.sendMessage("QUIT"),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error("QUIT timeout")), 2_000),
-          ),
-        ]);
-      }
-    } catch {
-      // Ignore errors during graceful shutdown
-    } finally {
-      this.disconnect();
-    }
+  async help(command?: string): FTPResponse {
+    return this.sendMessage("HELP", command);
   }
 }
