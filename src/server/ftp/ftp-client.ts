@@ -11,6 +11,15 @@ type PendingResponse = {
 const RESPONSE_TIMEOUT = 30_000 as const;
 const RESPONSE_DELIMITER = "\r\n" as const;
 
+type Response = {
+  raw: string;
+  code: number;
+  message: string;
+  ok: boolean;
+};
+
+type FTPResponse = Promise<Response>;
+
 export class FTPClient {
   private controlSocket: Bun.Socket<undefined> | null = null;
   private dataSocket: Bun.Socket<undefined> | null = null;
@@ -25,8 +34,7 @@ export class FTPClient {
   private rejectDataClosed: ((reason?: unknown) => void) | null = null;
 
   /**
-   * Wrapper around Bun.connect(...)
-   * Meant to be used with connectControlSocket or connectDataSocket
+   * Initializes a socket connection for either control or data streams.
    */
   private async connect(
     config: Config,
@@ -63,10 +71,8 @@ export class FTPClient {
   }
 
   /**
-   * Parses the control buffer for complete responses (terminated by \r\n)
-   * and resolves pending response promises. Handles multi-line responses
-   * following RFC 959 (e.g. "220-..." then "220 end"). Unsolicited
-   * responses are queued for the next awaitResponse() call.
+   * Processes the control buffer to extract and resolve FTP responses.
+   * Handles RFC 959 multi-line responses.
    */
   private drainControlBuffer() {
     while (true) {
@@ -76,17 +82,21 @@ export class FTPClient {
       const line = this.controlBuffer.slice(0, newlineIdx);
       let full: string;
 
-      // Multi-line: "xyz-..." continues until "xyz " appears
       if (/^\d{3}-/.test(line)) {
         const code = line.slice(0, 3);
         const endIdx = this.controlBuffer.indexOf(
           `${RESPONSE_DELIMITER}${code} `,
           newlineIdx,
         );
-        if (endIdx === -1) break; // wait for more data
+        if (endIdx === -1) break;
+
         const afterStart = endIdx + 2;
-        const finalNewline = this.controlBuffer.indexOf("\r\n", afterStart);
+        const finalNewline = this.controlBuffer.indexOf(
+          RESPONSE_DELIMITER,
+          afterStart,
+        );
         if (finalNewline === -1) break;
+
         full = this.controlBuffer.slice(0, finalNewline);
         this.controlBuffer = this.controlBuffer.slice(finalNewline + 2);
       } else {
@@ -103,14 +113,40 @@ export class FTPClient {
     }
   }
 
-  async connectControlSocket(config: Config): Promise<string> {
+  /**
+   * Transforms a raw FTP string into a structured Response object.
+   */
+  private parseResponse(raw: string): Response {
+    const code = parseInt(raw.slice(0, 3), 10);
+    return {
+      raw,
+      code,
+      message: raw.slice(4),
+      ok: code > 0 && code < 400,
+    };
+  }
+
+  /**
+   * Establishes the primary control connection to the FTP server.
+   */
+  async connectControlSocket(config: Config): FTPResponse {
     if (this.controlSocket) throw new Error("Control socket already exists");
     this.controlSocket = await this.connect(config, "control");
     return this.awaitResponse();
   }
 
+  private closeDataSocket() {
+    if (this.dataSocket) {
+      this.dataSocket.end();
+      this.dataSocket = null;
+    }
+  }
+
+  /**
+   * Establishes a secondary connection for data transfer.
+   */
   private async connectDataSocket(config: Config): Promise<void> {
-    if (this.dataSocket) this.dataSocket.end();
+    this.closeDataSocket();
     this.dataBuffer = [];
     this.dataSocketClosed = new Promise((resolve, reject) => {
       this.resolveDataClosed = resolve;
@@ -119,11 +155,16 @@ export class FTPClient {
     this.dataSocket = await this.connect(config, "data");
   }
 
-  private awaitResponse(): Promise<string> {
+  /**
+   * Returns a promise that resolves with the next available FTP response.
+   */
+  private async awaitResponse(): FTPResponse {
     const queued = this.responseQueue.shift();
-    if (queued !== undefined) return Promise.resolve(queued);
+    if (queued !== undefined) {
+      return this.parseResponse(queued);
+    }
 
-    return new Promise((resolve, reject) => {
+    const raw = await new Promise<string>((resolve, reject) => {
       const entry: PendingResponse = { resolve, reject };
       this.pendingResponses.push(entry);
 
@@ -136,48 +177,64 @@ export class FTPClient {
       }, RESPONSE_TIMEOUT);
 
       const wrap =
-        <T extends (v: never) => void>(fn: T) =>
-        (v: never) => {
+        <T extends (v: any) => void>(fn: T) =>
+        (v: any) => {
           clearTimeout(timeout);
           fn(v);
         };
-      entry.resolve = wrap(resolve) as PendingResponse["resolve"];
-      entry.reject = wrap(reject) as PendingResponse["reject"];
+      entry.resolve = wrap(resolve);
+      entry.reject = wrap(reject);
     });
+
+    return this.parseResponse(raw);
   }
 
-  // ---------- Commands ----------
-
   /**
-   * Sends a command on the control socket and awaits the server response.
+   * Sends a raw FTP command over the control socket.
    */
-  private async sendMessage(command: Commands, arg?: string): Promise<string> {
+  private async sendMessage(command: Commands, arg?: string): FTPResponse {
     if (!this.controlSocket) throw new Error("No control socket connected");
     const line = `${command}${arg ? " " + arg : ""}\r\n`;
     this.controlSocket.write(line);
     return this.awaitResponse();
   }
 
+  /**
+   * Sets the transfer mode to either ASCII or Image (Binary).
+   */
   async setTransferType(type: "ASCII" | "BINARY") {
     return this.sendMessage("TYPE", type === "ASCII" ? "A" : "I");
   }
 
-  async username(user: string): Promise<string> {
+  /**
+   * Sends the USER command for authentication.
+   */
+  async username(user: string): FTPResponse {
     return this.sendMessage("USER", user);
   }
 
-  async password(pass: string): Promise<string> {
+  /**
+   * Sends the PASS command for authentication.
+   */
+  async password(pass: string): FTPResponse {
     return this.sendMessage("PASS", pass);
   }
 
-  private async passive() {
+  /**
+   * Enters passive mode and initializes the data socket connection.
+   */
+  private async passive(): FTPResponse {
     const res = await this.sendMessage("PASV");
-    const config = this.parsePassiveResponse(res);
+    if (!res.ok) return res;
+    const config = this.parsePassiveResponse(res.raw);
     await this.connectDataSocket(config);
+    return res;
   }
 
+  /**
+   * Parses the host and port information from a PASV response.
+   */
   private parsePassiveResponse(res: string): Config {
-    // Response format: "227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)."
     const match = res.match(/\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)/);
     if (!match) throw new Error(`Invalid PASV response: ${res}`);
 
@@ -185,20 +242,24 @@ export class FTPClient {
     const host = `${h1}.${h2}.${h3}.${h4}`;
     const port = (Number(p1) << 8) + Number(p2);
 
-    const min = env.FTP_MIN_PASV_PORT;
-    const max = env.FTP_MAX_PASV_PORT;
-
-    if (port < min || port > max) {
-      throw new Error(`Port ${port} out of allowed range [${min}, ${max}]`);
+    if (env.NODE_ENV === "dev") {
+      const min = env.FTP_MIN_PASV_PORT;
+      const max = env.FTP_MAX_PASV_PORT;
+      if (port < min || port > max) {
+        throw new Error(`Port ${port} out of allowed range [${min}, ${max}]`);
+      }
     }
 
     return { host, port };
   }
 
-  async currentDirectory() {
+  async currentDirectory(): FTPResponse {
     return this.sendMessage("PWD");
   }
 
+  /**
+   * Merges all collected data chunks into a single Uint8Array.
+   */
   private concatDataBuffer(): Uint8Array {
     const total = this.dataBuffer.reduce((n, c) => n + c.byteLength, 0);
     const merged = new Uint8Array(total);
@@ -211,48 +272,75 @@ export class FTPClient {
   }
 
   /**
-   * @param path - Optional path. If not passed, lists current directory.
+   * Lists files in the specified path or current directory.
    */
-  async list(path?: string): Promise<string> {
-    await this.passive();
-    await this.sendMessage("LIST", path);
-    const transferComplete = this.awaitResponse();
-    await this.dataSocketClosed;
-    await transferComplete; // "226 Transfer complete"
+  async list(path?: string): Promise<Response & { data?: string }> {
+    const pRes = await this.passive();
+    if (!pRes.ok) return pRes;
 
-    const merged = this.concatDataBuffer();
-    this.dataSocket = null;
+    try {
+      const cmdRes = await this.sendMessage("LIST", path);
+      if (!cmdRes.ok) return cmdRes;
 
-    return new TextDecoder().decode(merged);
+      const transferComplete = this.awaitResponse();
+      await this.dataSocketClosed;
+      const transferRes = await transferComplete;
+
+      const merged = this.concatDataBuffer();
+      this.dataSocket = null;
+
+      return { ...transferRes, data: new TextDecoder().decode(merged) };
+    } finally {
+      this.closeDataSocket();
+    }
   }
 
-  async upload(file: {
-    path: string;
-    data: Uint8Array | string;
-  }): Promise<void> {
-    await this.passive();
-    await this.sendMessage("STOR", file.path);
-    const transferComplete = this.awaitResponse();
-    this.dataSocket!.write(file.data);
-    this.dataSocket!.end();
-    await this.dataSocketClosed;
-    await transferComplete;
-    this.dataSocket = null;
+  /**
+   * Uploads a file to the FTP server using the STOR command.
+   */
+  async upload(file: { path: string; data: Uint8Array | string }): FTPResponse {
+    const pRes = await this.passive();
+    if (!pRes.ok) return pRes;
+
+    try {
+      const cmdRes = await this.sendMessage("STOR", file.path);
+      if (!cmdRes.ok) return cmdRes;
+
+      const transferComplete = this.awaitResponse();
+      this.dataSocket!.write(file.data);
+      this.dataSocket!.end();
+
+      await this.dataSocketClosed;
+      return await transferComplete;
+    } finally {
+      this.closeDataSocket();
+    }
   }
 
-  async download(path: string): Promise<Uint8Array> {
-    await this.passive();
-    await this.sendMessage("RETR", path);
-    const transferComplete = this.awaitResponse();
-    await this.dataSocketClosed;
-    await transferComplete;
+  /**
+   * Downloads a file from the FTP server using the RETR command.
+   */
+  async download(path: string): Promise<Response & { data?: Uint8Array }> {
+    const pRes = await this.passive();
+    if (!pRes.ok) return pRes;
 
-    const merged = this.concatDataBuffer();
-    this.dataSocket = null;
-    return merged;
+    try {
+      const cmdRes = await this.sendMessage("RETR", path);
+      if (!cmdRes.ok) return cmdRes;
+
+      const transferComplete = this.awaitResponse();
+      await this.dataSocketClosed;
+      const transferRes = await transferComplete;
+
+      return { ...transferRes, data: this.concatDataBuffer() };
+    } finally {
+      this.closeDataSocket();
+    }
   }
 
-  /** Resets internals. */
+  /**
+   * Closes all connections and clears internal state.
+   */
   private disconnect() {
     this.controlSocket?.end();
     this.dataSocket?.end();
@@ -261,21 +349,24 @@ export class FTPClient {
     this.controlBuffer = "";
     this.dataBuffer = [];
     this.responseQueue = [];
+
     for (const p of this.pendingResponses) {
       p.reject(new Error("Client disconnected"));
     }
     this.pendingResponses = [];
+
     this.rejectDataClosed?.(new Error("Client disconnected"));
     this.dataSocketClosed = null;
     this.resolveDataClosed = null;
     this.rejectDataClosed = null;
   }
 
-  /** Wrapper around disconnect with graceful QUIT */
+  /**
+   * Gracefully shuts down the FTP session.
+   */
   async close() {
     try {
       if (this.controlSocket) {
-        // Race QUIT against a short timeout so a hung server doesn't block close.
         await Promise.race([
           this.sendMessage("QUIT"),
           new Promise((_, reject) =>
@@ -284,7 +375,7 @@ export class FTPClient {
         ]);
       }
     } catch {
-      // ignore – we're closing anyway
+      // Ignore errors during graceful shutdown
     } finally {
       this.disconnect();
     }

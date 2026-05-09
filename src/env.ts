@@ -5,6 +5,7 @@ export const env = createEnv({
   clientPrefix: "PUBLIC",
   client: {},
   server: {
+    NODE_ENV: z.enum(["prod", "dev"]),
     FTP_SERVER_HOST: z.string(),
     FTP_CONTROL_PORT: z
       .string()
@@ -24,6 +25,7 @@ export const env = createEnv({
     FTP_DEFAULT_USER_PASS: z.string(),
   },
   runtimeEnv: {
+    NODE_ENV: Bun.env.NODE_ENV,
     FTP_SERVER_HOST: Bun.env.FTP_SERVER_HOST,
     FTP_CONTROL_PORT: Bun.env.FTP_CONTROL_PORT,
     FTP_MIN_PASV_PORT: Bun.env.FTP_MIN_PASV_PORT,
